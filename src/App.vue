@@ -48,6 +48,24 @@
         </div>
       </div>
       <div v-if="!state.panel.minimized">
+        <div class="divider"></div>
+        <div v-if="supa">
+          <div v-if="!state.auth.user">
+            <div class="hint">注册或登录</div>
+            <div class="row"><label>邮箱</label><input type="email" v-model="state.auth.email" class="text" /></div>
+            <div class="row"><label>用户名</label><input type="text" v-model="state.auth.username" class="text" placeholder="用于显示与管理员识别" /></div>
+            <div class="row"><label>密码</label><input type="password" v-model="state.auth.password" class="text" /></div>
+            <div class="row"><button class="submit" @click="onRegister">注册</button><button class="submit" style="background:#3b82f6" @click="onLogin">登录</button></div>
+          </div>
+          <div v-else>
+            <div class="hint">当前用户</div>
+            <div class="row"><input type="text" :value="state.auth.user.email || ''" readonly class="text" /></div>
+            <div class="row"><input type="text" :value="state.auth.user.user_metadata?.username || ''" readonly class="text" /></div>
+            <div class="row" v-if="state.auth.isAdmin"><span>管理员</span></div>
+            <div class="row"><button class="submit" style="background:#ef4444" @click="onLogout">退出登录</button></div>
+          </div>
+        </div>
+        <div class="divider"></div>
         <div class="hint">每隔多久开始这项计划</div>
         <div class="row">
           <label>选择日期</label>
@@ -106,12 +124,17 @@
 
 <script setup>
 import { reactive, onMounted, watch, onUnmounted } from 'vue'
+import { createClient } from '@supabase/supabase-js'
 
 const now = new Date()
 const year = now.getFullYear()
 const years = [year, year + 1]
 const monthNames = ['一月','二月','三月','四月','五月','六月','七月','八月','九月','十月','十一月','十二月']
 const weekdays = ['一','二','三','四','五','六','日']
+
+const supaUrl = import.meta.env.VITE_SUPABASE_URL || ''
+const supaKey = import.meta.env.VITE_SUPABASE_ANON_KEY || ''
+const supa = (supaUrl && supaKey) ? createClient(supaUrl, supaKey) : null
 
 function daysInMonth(y, m) {
   return new Date(y, m, 0).getDate()
@@ -194,6 +217,7 @@ const state = reactive({
   cellScale: 1.35,
   done: {},
   tasks: [],
+  auth: { email: '', password: '', username: '', user: null, isAdmin: false },
   startDateStr: (() => {
     const mm = pad(now.getMonth() + 1)
     const dd = pad(now.getDate())
@@ -326,10 +350,12 @@ function onSelectDay(y, m, d) {
   state.editRed = typeof e === 'object' ? !!e.red : false
 }
 function persistManual() {
-  try { localStorage.setItem('rili-manual', JSON.stringify(state.manual)) } catch {}
+  if (state.auth.user && supa) saveRemote()
+  else try { localStorage.setItem('rili-manual', JSON.stringify(state.manual)) } catch {}
 }
 function persistTasks() {
-  try { localStorage.setItem('rili-tasks', JSON.stringify(state.tasks)) } catch {}
+  if (state.auth.user && supa) saveRemote()
+  else try { localStorage.setItem('rili-tasks', JSON.stringify(state.tasks)) } catch {}
 }
 function recomputeGenerated() {
   const gen = {}
@@ -354,7 +380,59 @@ function deleteTask(id) {
 }
 function isDone(key) { return !!state.done[key] }
 function toggleDone(key, checked) { if (checked) state.done[key] = true; else delete state.done[key]; persistDone() }
-function persistDone() { try { localStorage.setItem('rili-done', JSON.stringify(state.done)) } catch {} }
+function persistDone() { if (state.auth.user && supa) saveRemote(); else try { localStorage.setItem('rili-done', JSON.stringify(state.done)) } catch {} }
+async function saveRemote() {
+  try {
+    const user = state.auth.user
+    if (!user || !supa) return
+    const payload = { user_id: user.id, manual: state.manual, tasks: state.tasks, done: state.done }
+    await supa.from('rili_data').upsert(payload, { onConflict: 'user_id' })
+  } catch {}
+}
+async function loadRemote() {
+  try {
+    const user = state.auth.user
+    if (!user || !supa) return
+    const { data } = await supa.from('rili_data').select('manual,tasks,done').eq('user_id', user.id).single()
+    if (data) {
+      state.manual = data.manual || {}
+      state.tasks = Array.isArray(data.tasks) ? data.tasks : []
+      state.done = data.done || {}
+      recomputeGenerated()
+    }
+  } catch {}
+}
+async function onRegister() {
+  if (!supa) return
+  const email = (state.auth.email || '').trim()
+  const password = (state.auth.password || '').trim()
+  const username = (state.auth.username || '').trim()
+  if (!email || !password || !username) return
+  const { data } = await supa.auth.signUp({ email, password, options: { data: { username } } })
+  if (data && data.user) {
+    state.auth.user = data.user
+    state.auth.isAdmin = (data.user.user_metadata && data.user.user_metadata.username === 'pyq')
+    await loadRemote()
+  }
+}
+async function onLogin() {
+  if (!supa) return
+  const email = (state.auth.email || '').trim()
+  const password = (state.auth.password || '').trim()
+  if (!email || !password) return
+  const { data } = await supa.auth.signInWithPassword({ email, password })
+  if (data && data.user) {
+    state.auth.user = data.user
+    state.auth.isAdmin = (data.user.user_metadata && data.user.user_metadata.username === 'pyq')
+    await loadRemote()
+  }
+}
+async function onLogout() {
+  if (!supa) return
+  await supa.auth.signOut()
+  state.auth.user = null
+  state.auth.isAdmin = false
+}
 watch(() => [state.editDate, state.editText, state.editRed], () => {
   const k = state.editDate
   const text = (state.editText || '').trim()
@@ -368,6 +446,14 @@ watch(() => [state.editDate, state.editText, state.editRed], () => {
   persistManual()
 })
 onMounted(() => {
+  if (supa) {
+    supa.auth.onAuthStateChange(async (_, session) => {
+      const u = session && session.user
+      state.auth.user = u || null
+      state.auth.isAdmin = !!(u && u.user_metadata && u.user_metadata.username === 'pyq')
+      if (u) await loadRemote()
+    })
+  }
   try {
     const savedManual = localStorage.getItem('rili-manual')
     if (savedManual) {
